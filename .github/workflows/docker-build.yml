@@ -1,0 +1,97 @@
+name: Build and Push Custom Caddy Image
+
+on:
+  schedule:
+    # Runs daily at 03:00 UTC
+    - cron: '0 3 * * *'
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch latest upstream Caddy release
+        id: upstream
+        run: |
+          UPSTREAM_TAG=$(curl -s "https://api.github.com/repos/caddyserver/caddy/releases/latest" | jq -r '.tag_name')
+          VERSION=${UPSTREAM_TAG#v}
+          echo "tag=${UPSTREAM_TAG}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Latest upstream version found: ${VERSION}"
+
+      - name: Check if tag already exists in GHCR
+        id: check_tag
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IMAGE_EXISTS=$(gh api "/orgs/${{ github.repository_owner }}/packages/container/${{ github.event.repository.name }}/versions" 2>/dev/null | jq -r --arg tag "${{ steps.upstream.outputs.version }}" '.[]?.metadata.container.tags[]? | select(. == $tag)' || true)
+
+          if [ -z "$IMAGE_EXISTS" ]; then
+            IMAGE_EXISTS=$(gh api "/users/${{ github.repository_owner }}/packages/container/${{ github.event.repository.name }}/versions" 2>/dev/null | jq -r --arg tag "${{ steps.upstream.outputs.version }}" '.[]?.metadata.container.tags[]? | select(. == $tag)' || true)
+          fi
+
+          if [ "$IMAGE_EXISTS" = "${{ steps.upstream.outputs.version }}" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag ${{ steps.upstream.outputs.version }} already exists in GHCR. Skipping build."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "New version detected. Proceeding to build."
+          fi
+
+      - name: Set up QEMU
+        if: steps.check_tag.outputs.exists != 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.check_tag.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: steps.check_tag.outputs.exists != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        if: steps.check_tag.outputs.exists != 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.upstream.outputs.version }}
+            type=raw,value=${{ steps.upstream.outputs.tag }}
+
+      - name: Build and push Docker image
+        if: steps.check_tag.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            CADDY_VERSION=${{ steps.upstream.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
